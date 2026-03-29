@@ -15,14 +15,13 @@ Authentication:
   - Set env var MESS_AUTH_KEY to avoid passing auth_key on every call.
 """
 
-import json
 import os
 from typing import Optional
 from enum import Enum
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 
 #import load env
 from dotenv import load_dotenv
@@ -32,7 +31,15 @@ from dotenv import load_dotenv
 BASE_URL = "https://mess.iiit.ac.in/api"
 TIMEOUT = 15.0
 
-mcp = FastMCP("mess_mcp")
+mcp = FastMCP(
+    "IIITH Mess",
+    instructions=(
+        "Manage IIIT Hyderabad mess meals. Use these tools to: check or look up meal "
+        "registrations (what am I eating today/tomorrow/this week), register or cancel meals, "
+        "view menus and meal timings, track monthly bills, and update notification preferences. "
+        "Requires IIIT VPN. Authentication is handled automatically via MESS_AUTH_KEY env var."
+    ),
+)
 load_dotenv()
 
 
@@ -58,7 +65,7 @@ async def _req(
     session: Optional[str] = None,
     params: Optional[dict] = None,
     body: Optional[dict] = None,
-) -> dict:
+) -> dict | list:
     clean_params = {k: v for k, v in (params or {}).items() if v is not None} or None
     clean_body = {k: v for k, v in (body or {}).items() if v is not None} or None
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -71,16 +78,22 @@ async def _req(
         )
         try:
             resp.raise_for_status()
-            return resp.json() if resp.content else {"status": resp.status_code, "ok": True}
+            if not resp.content:
+                return {"ok": True}
+            resp_body = resp.json()
+            # unwrap API envelope: {"data": ...} → just the data
+            if isinstance(resp_body, dict) and "data" in resp_body:
+                return resp_body["data"]
+            return resp_body
         except httpx.HTTPStatusError as e:
             try:
-                return {"http_error": e.response.status_code, "detail": e.response.json()}
+                err = e.response.json()
+                # unwrap {"error": {...}} → just the error object
+                if isinstance(err, dict) and "error" in err:
+                    return {"error": err["error"]}
+                return err
             except Exception:
-                return {"http_error": e.response.status_code, "detail": e.response.text}
-
-
-def _out(data: dict) -> str:
-    return json.dumps(data, indent=2, default=str)
+                return {"error": {"status": e.response.status_code, "detail": e.response.text}}
 
 
 # ─────────────────────────────────────────────
@@ -157,18 +170,9 @@ class MessMenuInput(BaseModel):
 #     meal: Meal = Field(..., description="Meal: breakfast, lunch, snacks, or dinner")
 #     on: Optional[str] = Field(default=None, description="Date YYYY-MM-DD. Defaults to today.")
 
-class MessMealDateInput(BaseModel):
-    model_config = cfg
-    meal: str = Field(..., description="Meal: breakfast, lunch, snacks, or dinner. One of: breakfast, lunch, snacks, dinner")
+class MessMealDateInput(AuthInput):
+    meal: Meal = Field(..., description="Meal: breakfast, lunch, snacks, or dinner")
     on: Optional[str] = Field(default=None, description="Date YYYY-MM-DD. Defaults to today.")
-
-    @field_validator("meal")
-    @classmethod
-    def validate_meal(cls, v: str) -> str:
-        valid = {"breakfast", "lunch", "snacks", "dinner"}
-        if v not in valid:
-            raise ValueError(f"meal must be one of {valid}")
-        return v
 
 
 class GetRegistrationsInput(AuthInput):
@@ -243,8 +247,7 @@ class ScansInput(BaseModel):
     date: Optional[str] = Field(default=None, description="Date YYYY-MM-DD. Defaults to today.")
 
 
-class ListExtrasInput(BaseModel):
-    model_config = cfg
+class ListExtrasInput(AuthInput):
     meal: Meal = Field(..., description="Meal name")
     date: Optional[str] = Field(default=None, description="Date YYYY-MM-DD. Defaults to today.")
     mess: Optional[str] = Field(default=None, description="Mess ID. If omitted, returns all messes.")
@@ -287,6 +290,7 @@ class UserPreferencesInput(AuthInput):
     auto_reset_token_daily: bool = Field(..., description="Auto-reset QR at 02:00 daily")
     enable_unregistered: bool = Field(..., description="Allow on-spot availing at unregistered rates")
     nag_for_feedback: bool = Field(..., description="Prompt for feedback after every availed meal")
+    skip_malloced: bool = Field(..., description="Automatically skip randomly allocated meals (don't attend them)")
 
 
 # ─────────────────────────────────────────────
@@ -295,13 +299,13 @@ class UserPreferencesInput(AuthInput):
 
 @mcp.tool(name="mess_cas_login_info",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
-async def mess_cas_login_info() -> str:
+async def mess_cas_login_info() -> dict | list:
     """Get instructions for IIIT student CAS login (browser-only, cannot be called via API/AJAX).
 
     Returns:
-        str: Step-by-step instructions for obtaining a session cookie
+        Step-by-step instructions for obtaining a session cookie
     """
-    return json.dumps({
+    return {
         "info": "IIIT CAS login requires a browser redirect — it cannot be called programmatically.",
         "steps": [
             "1. Open https://mess.iiit.ac.in in your browser on VPN and log in via CAS",
@@ -309,19 +313,19 @@ async def mess_cas_login_info() -> str:
             "3. Copy the value of the 'session' cookie",
             "4. Pass it as the 'session' parameter in any authenticated tool call"
         ]
-    }, indent=2)
+    }
 
 
 @mcp.tool(name="mess_login_msit",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_login_msit(params: MsitLoginInput) -> str:
+async def mess_login_msit(params: MsitLoginInput) -> dict | list:
     """Login as an MSIT student or intern using email + password.
 
     Args:
         params: user (email address), password
 
     Returns:
-        str: JSON User object. 'session_hint' contains the session cookie value
+        JSON User object. 'session_hint' contains the session cookie value
              to pass as 'session' in subsequent tool calls.
     """
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -331,113 +335,115 @@ async def mess_login_msit(params: MsitLoginInput) -> str:
         )
         try:
             resp.raise_for_status()
-            data = resp.json()
+            body = resp.json()
+            data = body.get("data", body) if isinstance(body, dict) and "data" in body else body
             sc = resp.cookies.get("session")
             if sc:
                 data["session_hint"] = {"session": sc, "usage": "Pass as 'session' in other tools"}
-            return _out(data)
+            return data
         except httpx.HTTPStatusError as e:
             try:
-                return _out({"http_error": e.response.status_code, "detail": e.response.json()})
+                err = e.response.json()
+                return {"error": err.get("error", err)} if isinstance(err, dict) and "error" in err else err
             except Exception:
-                return _out({"http_error": e.response.status_code, "detail": e.response.text})
+                return {"error": {"status": e.response.status_code, "detail": e.response.text}}
 
 
 @mcp.tool(name="mess_get_me",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_me(params: AuthInput) -> str:
+async def mess_get_me(params: AuthInput) -> dict | list:
     """Get the currently logged-in user's profile.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON User object (id, name, email, roll_number, token, attributes, tags)
+        JSON User object (id, name, email, roll_number, token, attributes, tags)
     """
-    return _out(await _req("GET", "/auth/me", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/auth/me", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_auth_keys",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_auth_keys(params: AuthInput) -> str:
+async def mess_get_auth_keys(params: AuthInput) -> dict | list:
     """Get all auth keys for the current user (including expired ones).
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON array of AuthKey objects (name, user_id, created_at, expires_at)
+        JSON array of AuthKey objects (name, user_id, created_at, expires_at)
     """
-    return _out(await _req("GET", "/auth/keys", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/auth/keys", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_create_auth_key",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_create_auth_key(params: CreateAuthKeyInput) -> str:
+async def mess_create_auth_key(params: CreateAuthKeyInput) -> dict | list:
     """Create a new API auth key. Key names must be unique.
 
     Args:
         params: auth_key/session, name (unique friendly name), expiry (YYYY-MM-DD)
 
     Returns:
-        str: JSON AuthKey including the key value — save this, it won't be shown again.
+        JSON AuthKey including the key value — save this, it won't be shown again.
              Returns 409 if a key with the same name already exists.
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/auth/keys",
         auth_key=params.auth_key, session=params.session,
         body={"name": params.name, "expiry": params.expiry}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_auth_key_info",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_auth_key_info(params: AuthInput) -> str:
+async def mess_get_auth_key_info(params: AuthInput) -> dict | list:
     """Get info about the auth key currently in use (passed in Authorization header).
 
     Args:
         params: auth_key (the key to inspect)
 
     Returns:
-        str: JSON AuthKey details. Returns 401/403 if the key is expired.
+        JSON AuthKey details. Returns 401/403 if the key is expired.
     """
-    return _out(await _req("GET", "/auth/keys/info", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/auth/keys/info", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_delete_auth_key",
           annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
-async def mess_delete_auth_key(params: AuthKeyNameInput) -> str:
+async def mess_delete_auth_key(params: AuthKeyNameInput) -> dict | list:
     """Delete an auth key by its name (not its value). Identified by name in the URL path.
 
     Args:
         params: auth_key/session for auth, name = the friendly name of the key to delete
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "DELETE", f"/auth/keys/{params.name}",
         auth_key=params.auth_key, session=params.session
-    ))
+    )
 
 
 @mcp.tool(name="mess_reset_qr_token",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_reset_qr_token(params: AuthInput) -> str:
+async def mess_reset_qr_token(params: AuthInput) -> dict | list:
     """Reset the user's QR code token (shown at the mess counter).
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON { token: string } — new URL-safe base64 token
+        JSON { token: string } — new URL-safe base64 token
     """
-    return _out(await _req("POST", "/auth/reset-token", auth_key=params.auth_key, session=params.session))
+    return await _req("POST", "/auth/reset-token", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_generate_reset_password_otp",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_generate_reset_password_otp(params: ResetPassInput) -> str:
+async def mess_generate_reset_password_otp(params: ResetPassInput) -> dict | list:
     """Send a password reset OTP to the given email. Only for MSIT/intern accounts.
 
     Rate limited to once per minute. Returns 204 even if email is invalid.
@@ -446,26 +452,26 @@ async def mess_generate_reset_password_otp(params: ResetPassInput) -> str:
         params: email address
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req("POST", "/auth/reset-pass", body={"email": params.email}))
+    return await _req("POST", "/auth/reset-pass", body={"email": params.email})
 
 
 @mcp.tool(name="mess_complete_password_reset",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_complete_password_reset(params: ResetPassVerifyInput) -> str:
+async def mess_complete_password_reset(params: ResetPassVerifyInput) -> dict | list:
     """Complete password reset with OTP + new password.
 
     Args:
         params: email, otp (6-digit string e.g. '123456'), password (new password)
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/auth/reset-pass/verify",
         body={"email": params.email, "otp": params.otp, "password": params.password}
-    ))
+    )
 
 
 # ─────────────────────────────────────────────
@@ -474,23 +480,22 @@ async def mess_complete_password_reset(params: ResetPassVerifyInput) -> str:
 
 @mcp.tool(name="mess_get_info",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_info(params: AuthInput) -> str:
-    """Get info about all messes (name, short_name, color, tags, rating, billing_id). No rates.
-
-    Args:
-        params: auth_key or session
+async def mess_get_info() -> dict | list:
+    """Get info about all messes (name, short_name, color, tags, rating, billing_id). No auth required.
 
     Returns:
-        str: JSON array of MessInfo objects
+        JSON array of MessInfo objects
     """
-    return _out(await _req("GET", "/mess/info", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/mess/info")
 
 
 @mcp.tool(name="mess_get_menus",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_menus(params: MessMenuInput) -> str:
-    """Get mess menus for a date (all messes returned). No auth required.
+async def mess_get_menus(params: MessMenuInput) -> dict | list:
+    """Get the food menu for all messes on a date. No auth required.
 
+    Use to answer "what's for lunch today?", "what's on the menu this week?",
+    "what is [mess] serving for dinner?".
     Menu structure per mess: { day_name: { meal: [{ category, name }] } }
     Menus are stored week-wise (Sunday-anchored). effective_from always falls on a Sunday.
 
@@ -498,14 +503,14 @@ async def mess_get_menus(params: MessMenuInput) -> str:
         params: on (YYYY-MM-DD, optional, defaults to today)
 
     Returns:
-        str: JSON array of { mess, updated_at, effective_from, days }
+        JSON array of { mess, updated_at, effective_from, days }
     """
-    return _out(await _req("GET", "/mess/menus", params={"on": params.on}))
+    return await _req("GET", "/mess/menus", params={"on": params.on})
 
 
 @mcp.tool(name="mess_get_rates",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_rates(params: MessMealDateInput) -> str:
+async def mess_get_rates(params: MessMealDateInput) -> dict | list:
     """Get mess rates (in paise) for a meal on a date, grouped by category.
 
     Categories: registered, unregistered, guest, extra.
@@ -514,23 +519,23 @@ async def mess_get_rates(params: MessMealDateInput) -> str:
         params: meal (required), on (YYYY-MM-DD, optional)
 
     Returns:
-        str: JSON { category: [{ mess, day, rate }] } — rate in paise
+        JSON { category: [{ mess, day, rate }] } — rate in paise
     """
-    return _out(await _req("GET", "/mess/rates", params={"meal": params.meal, "on": params.on}))
+    return await _req("GET", "/mess/rates", auth_key=params.auth_key, session=params.session, params={"meal": params.meal, "on": params.on})
 
 
 @mcp.tool(name="mess_get_capacities",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_capacities(params: MessMealDateInput) -> str:
+async def mess_get_capacities(params: MessMealDateInput) -> dict | list:
     """Get mess capacities for a meal on a date, grouped by category.
 
     Args:
         params: meal (required), on (YYYY-MM-DD, optional)
 
     Returns:
-        str: JSON { category: [{ mess, available, capacity }] }
+        JSON { category: [{ mess, available, capacity }] }
     """
-    return _out(await _req("GET", "/mess/capacities", params={"meal": params.meal, "on": params.on}))
+    return await _req("GET", "/mess/capacities", auth_key=params.auth_key, session=params.session, params={"meal": params.meal, "on": params.on})
 
 
 # ─────────────────────────────────────────────
@@ -539,38 +544,43 @@ async def mess_get_capacities(params: MessMealDateInput) -> str:
 
 @mcp.tool(name="mess_get_registrations",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_registrations(params: GetRegistrationsInput) -> str:
-    """Get all meal registrations in a date range (max 2 months, both dates inclusive).
+async def mess_get_registrations(params: GetRegistrationsInput) -> dict | list:
+    """Look up what meals the user is registered for over a date range.
+
+    Use this to answer: "what am I eating today/tomorrow/this week?",
+    "show my registrations", "which meals do I have booked?".
+    Max range: 2 months. Both dates are inclusive.
 
     Args:
         params: auth_key/session, from (YYYY-MM-DD), to (YYYY-MM-DD)
 
     Returns:
-        str: JSON array of MealRegistration objects
+        JSON array of MealRegistration objects
              (meal_date, meal_type, meal_mess, category, user_id,
               registered_at, cancelled_at, availed_at, availed_price, monthly_reg)
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations",
         auth_key=params.auth_key, session=params.session,
         params={"from": params.from_date, "to": params.to_date}
-    ))
+    )
 
 
 @mcp.tool(name="mess_create_registration",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_create_registration(params: CreateRegistrationInput) -> str:
-    """Register for a meal, or update an existing registration.
+async def mess_create_registration(params: CreateRegistrationInput) -> dict | list:
+    """Register the user for a meal at a specific mess on a date.
 
-    Fails with 403 (window-closed or capacity-exceeded) if not possible.
+    Use this when the user wants to book/register for breakfast, lunch, or dinner.
+    Fails with 403 if the registration window is closed or the mess is full.
 
     Args:
         params: auth_key/session, meal_date, meal_type, meal_mess, optional guests (int)
 
     Returns:
-        str: JSON MealRegistration on success, or 204 if already registered
+        JSON MealRegistration on success, or 204 if already registered
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations",
         auth_key=params.auth_key, session=params.session,
         body={
@@ -579,33 +589,35 @@ async def mess_create_registration(params: CreateRegistrationInput) -> str:
             "meal_mess": params.meal_mess,
             "guests": params.guests,
         }
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_registration",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_registration(params: GetOneRegistrationInput) -> str:
-    """Get registration(s) for a date. Only returns registered (non-cancelled) meals.
+async def mess_get_registration(params: GetOneRegistrationInput) -> dict | list:
+    """Look up the user's registration for a single date (defaults to today).
 
-    If meal is omitted, returns { meal_type: MealRegistration } for all meals on that date.
+    Use this to answer "am I registered for lunch today?", "what mess am I going to tonight?".
+    Only returns active (non-cancelled) registrations.
+    If meal is omitted, returns all meals for the date as { meal_type: MealRegistration }.
     If date is omitted, defaults to today.
 
     Args:
         params: auth_key/session, optional meal, optional date (YYYY-MM-DD)
 
     Returns:
-        str: JSON MealRegistration or object keyed by meal name
+        JSON MealRegistration or object keyed by meal name
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registration",
         auth_key=params.auth_key, session=params.session,
         params={"meal": params.meal.value if params.meal else None, "date": params.date}
-    ))
+    )
 
 
 @mcp.tool(name="mess_skip_meal",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_skip_meal(params: SkipMealInput) -> str:
+async def mess_skip_meal(params: SkipMealInput) -> dict | list:
     """Mark a registration as skipped or unskipped.
 
     Skipping = user likely won't attend but is still charged.
@@ -615,9 +627,9 @@ async def mess_skip_meal(params: SkipMealInput) -> str:
         params: auth_key/session, meal_date, meal_type, meal_mess, skipping (bool)
 
     Returns:
-        str: JSON updated MealRegistration
+        JSON updated MealRegistration
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations/skipping",
         auth_key=params.auth_key, session=params.session,
         body={
@@ -626,32 +638,33 @@ async def mess_skip_meal(params: SkipMealInput) -> str:
             "meal_mess": params.meal_mess,
             "skipping": params.skipping,
         }
-    ))
+    )
 
 
 @mcp.tool(name="mess_cancel_registration",
           annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
-async def mess_cancel_registration(params: MealDateTypeInput) -> str:
-    """Cancel a meal registration.
+async def mess_cancel_registration(params: MealDateTypeInput) -> dict | list:
+    """Cancel a meal registration so the user is not charged for it.
 
-    Returns 403 if cancellation window is closed, 424 if no registration exists.
+    Use when the user wants to cancel/drop a booked meal.
+    Returns 403 if the cancellation window is closed, 424 if no registration exists.
 
     Args:
         params: auth_key/session, meal_date, meal_type
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations/cancel",
         auth_key=params.auth_key, session=params.session,
         body={"meal_date": params.meal_date, "meal_type": params.meal_type}
-    ))
+    )
 
 
 @mcp.tool(name="mess_uncancel_registration",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_uncancel_registration(params: MealDateTypeInput) -> str:
+async def mess_uncancel_registration(params: MealDateTypeInput) -> dict | list:
     """Restore a previously cancelled meal registration.
 
     Returns 424 if the registration was not cancelled.
@@ -660,18 +673,18 @@ async def mess_uncancel_registration(params: MealDateTypeInput) -> str:
         params: auth_key/session, meal_date, meal_type
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations/uncancel",
         auth_key=params.auth_key, session=params.session,
         body={"meal_date": params.meal_date, "meal_type": params.meal_type}
-    ))
+    )
 
 
 @mcp.tool(name="mess_provide_feedback",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_provide_feedback(params: FeedbackInput) -> str:
+async def mess_provide_feedback(params: FeedbackInput) -> dict | list:
     """Submit anonymous feedback for a meal. User must have availed the meal.
 
     Returns 409 if feedback already submitted, 424 if meal not availed.
@@ -680,9 +693,9 @@ async def mess_provide_feedback(params: FeedbackInput) -> str:
         params: auth_key/session, meal_date, meal_type, rating (1-5), optional remarks
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations/feedback",
         auth_key=params.auth_key, session=params.session,
         body={
@@ -691,12 +704,12 @@ async def mess_provide_feedback(params: FeedbackInput) -> str:
             "rating": params.rating,
             "remarks": params.remarks,
         }
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_meal_rating",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_meal_rating(params: MealRatingInput) -> str:
+async def mess_get_meal_rating(params: MealRatingInput) -> dict | list:
     """Get the average rating for a meal at a mess on a date.
 
     If mess is omitted, returns ratings keyed by mess ID.
@@ -706,18 +719,18 @@ async def mess_get_meal_rating(params: MealRatingInput) -> str:
         params: auth_key/session, meal (required), optional mess, optional date
 
     Returns:
-        str: JSON { rating: float, count: int } or { mess_id: { rating, count } }
+        JSON { rating: float, count: int } or { mess_id: { rating, count } }
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registration/rating",
         auth_key=params.auth_key, session=params.session,
         params={"meal": params.meal, "mess": params.mess, "date": params.date}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_monthly_registration",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_monthly_registration(params: MonthYearInput) -> str:
+async def mess_get_monthly_registration(params: MonthYearInput) -> dict | list:
     """Get the monthly mess registration for the current user.
 
     Also returns snack availments for the month.
@@ -726,18 +739,18 @@ async def mess_get_monthly_registration(params: MonthYearInput) -> str:
         params: auth_key/session, optional month (1-12), optional year
 
     Returns:
-        str: JSON { registration: MonthlyRegistration, snack_availments: [...] }
+        JSON { registration: MonthlyRegistration, snack_availments: [...] }
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations/monthly",
         auth_key=params.auth_key, session=params.session,
         params={"month": params.month, "year": params.year}
-    ))
+    )
 
 
 @mcp.tool(name="mess_create_monthly_registration",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_create_monthly_registration(params: CreateMonthlyRegInput) -> str:
+async def mess_create_monthly_registration(params: CreateMonthlyRegInput) -> dict | list:
     """Register at a mess for an entire month.
 
     Returns 409 if already registered, 403 if window closed or mess full.
@@ -746,18 +759,18 @@ async def mess_create_monthly_registration(params: CreateMonthlyRegInput) -> str
         params: auth_key/session, month (1-12), year, mess (mess ID)
 
     Returns:
-        str: JSON MonthlyRegistration object
+        JSON MonthlyRegistration object
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations/monthly",
         auth_key=params.auth_key, session=params.session,
         body={"month": params.month, "year": params.year, "mess": params.mess}
-    ))
+    )
 
 
 @mcp.tool(name="mess_delete_monthly_registration",
           annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
-async def mess_delete_monthly_registration(params: DeleteMonthlyRegInput) -> str:
+async def mess_delete_monthly_registration(params: DeleteMonthlyRegInput) -> dict | list:
     """Delete a monthly mess registration (individual meal registrations are kept).
 
     Returns 403 if window closed.
@@ -766,37 +779,39 @@ async def mess_delete_monthly_registration(params: DeleteMonthlyRegInput) -> str
         params: auth_key/session, month (1-12), year
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "DELETE", "/registrations/monthly",
         auth_key=params.auth_key, session=params.session,
         params={"month": params.month, "year": params.year}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_cancellations_count",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_cancellations_count(params: CancellationsInput) -> str:
+async def mess_get_cancellations_count(params: CancellationsInput) -> dict | list:
     """Get count of cancelled registrations for a meal in a month.
 
     Args:
         params: auth_key/session, meal (required), optional month, optional year
 
     Returns:
-        str: JSON integer count
+        JSON integer count
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations/cancellations",
         auth_key=params.auth_key, session=params.session,
         params={"meal": params.meal, "month": params.month, "year": params.year}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_bill",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_bill(params: MonthYearInput) -> str:
-    """Get the mess bill for a month (in paise). May be projected (includes future meals).
+async def mess_get_bill(params: MonthYearInput) -> dict | list:
+    """Get the user's mess bill for a month. Use to answer "how much do I owe?", "what's my bill?".
+
+    Amounts are in paise — divide by 100 for rupees. May include projected future meals.
 
     Returns 404 if registrations haven't opened for that month.
 
@@ -804,53 +819,53 @@ async def mess_get_bill(params: MonthYearInput) -> str:
         params: auth_key/session, optional month, optional year
 
     Returns:
-        str: JSON { non_projected: int, projected: int } — in paise (divide by 100 for rupees)
+        JSON { non_projected: int, projected: int } — in paise (divide by 100 for rupees)
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations/bill",
         auth_key=params.auth_key, session=params.session,
         params={"month": params.month, "year": params.year}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_scans_count",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_scans_count(params: ScansInput) -> str:
+async def mess_get_scans_count(params: ScansInput) -> dict | list:
     """Get meal availment (scan) count for a mess on a date. No authentication required.
 
     Args:
         params: meal (required), mess (required), optional date (YYYY-MM-DD)
 
     Returns:
-        str: JSON { meal, mess, date, total: int, recent: int (last 10 min) }
+        JSON { meal, mess, date, total: int, recent: int (last 10 min) }
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations/scans",
         params={"meal": params.meal, "mess": params.mess, "date": params.date}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_registered_extras",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_registered_extras(params: GetRegisteredExtrasInput) -> str:
+async def mess_get_registered_extras(params: GetRegisteredExtrasInput) -> dict | list:
     """Get extra item registrations for the current user for a meal on a date.
 
     Args:
         params: auth_key/session, meal (required), optional date (YYYY-MM-DD)
 
     Returns:
-        str: JSON array of ExtraRegistration objects
+        JSON array of ExtraRegistration objects
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations/extras",
         auth_key=params.auth_key, session=params.session,
         params={"meal": params.meal, "date": params.date}
-    ))
+    )
 
 
 @mcp.tool(name="mess_create_extra_registration",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
-async def mess_create_extra_registration(params: CreateExtraRegInput) -> str:
+async def mess_create_extra_registration(params: CreateExtraRegInput) -> dict | list:
     """Register for an extra item on a meal.
 
     User must have a regular registration at that mess for that meal.
@@ -860,9 +875,9 @@ async def mess_create_extra_registration(params: CreateExtraRegInput) -> str:
         params: auth_key/session, extra (item ID), meal_date, meal_type, meal_mess
 
     Returns:
-        str: JSON array of ExtraRegistrationInserted objects
+        JSON array of ExtraRegistrationInserted objects
     """
-    return _out(await _req(
+    return await _req(
         "POST", "/registrations/extras",
         auth_key=params.auth_key, session=params.session,
         body={
@@ -871,43 +886,43 @@ async def mess_create_extra_registration(params: CreateExtraRegInput) -> str:
             "meal_type": params.meal_type,
             "meal_mess": params.meal_mess,
         }
-    ))
+    )
 
 
 @mcp.tool(name="mess_delete_extra_registration",
           annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
-async def mess_delete_extra_registration(params: DeleteExtraRegInput) -> str:
+async def mess_delete_extra_registration(params: DeleteExtraRegInput) -> dict | list:
     """Delete an extra registration by its ID (passed as query param).
 
     Args:
         params: auth_key/session, id (extra registration ID)
 
     Returns:
-        str: JSON array of remaining ExtraRegistration objects
+        JSON array of remaining ExtraRegistration objects
     """
-    return _out(await _req(
+    return await _req(
         "DELETE", "/registrations/extras",
         auth_key=params.auth_key, session=params.session,
         params={"id": params.id}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_extras_in_range",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_extras_in_range(params: ExtrasRangeInput) -> str:
+async def mess_get_extras_in_range(params: ExtrasRangeInput) -> dict | list:
     """Get all extra registrations in a date range (max 2 months, both inclusive).
 
     Args:
         params: auth_key/session, from (YYYY-MM-DD), to (YYYY-MM-DD)
 
     Returns:
-        str: JSON array of ExtraRegistration objects
+        JSON array of ExtraRegistration objects
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/registrations/extras/range",
         auth_key=params.auth_key, session=params.session,
         params={"from": params.from_date, "to": params.to_date}
-    ))
+    )
 
 
 # ─────────────────────────────────────────────
@@ -916,7 +931,7 @@ async def mess_get_extras_in_range(params: ExtrasRangeInput) -> str:
 
 @mcp.tool(name="mess_list_extras",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_list_extras(params: ListExtrasInput) -> str:
+async def mess_list_extras(params: ListExtrasInput) -> dict | list:
     """List available extra items for a meal on a date.
 
     Some extras (same ID) may be available across multiple meals.
@@ -925,12 +940,13 @@ async def mess_list_extras(params: ListExtrasInput) -> str:
         params: meal (required), optional date (YYYY-MM-DD), optional mess ID
 
     Returns:
-        str: JSON array of ExtraItem objects (id, name, description, rate in paise, mess, food_tags)
+        JSON array of ExtraItem objects (id, name, description, rate in paise, mess, food_tags)
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/extras",
+        auth_key=params.auth_key, session=params.session,
         params={"meal": params.meal, "date": params.date, "mess": params.mess}
-    ))
+    )
 
 
 # ─────────────────────────────────────────────
@@ -939,7 +955,7 @@ async def mess_list_extras(params: ListExtrasInput) -> str:
 
 @mcp.tool(name="mess_get_all_bills",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_all_bills(params: AuthInput) -> str:
+async def mess_get_all_bills(params: AuthInput) -> dict | list:
     """Get bill breakdown for all months with a non-zero bill.
 
     Includes food_bill, extras_bill, and infra_bill (all in paise).
@@ -949,9 +965,9 @@ async def mess_get_all_bills(params: AuthInput) -> str:
         params: auth_key or session
 
     Returns:
-        str: JSON array of { month, year, food_bill, extras_bill, infra_bill } — all in paise
+        JSON array of { month, year, food_bill, extras_bill, infra_bill } — all in paise
     """
-    return _out(await _req("GET", "/bills", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/bills", auth_key=params.auth_key, session=params.session)
 
 
 # ─────────────────────────────────────────────
@@ -960,132 +976,132 @@ async def mess_get_all_bills(params: AuthInput) -> str:
 
 @mcp.tool(name="mess_get_all_windows",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_all_windows(params: AuthInput) -> str:
+async def mess_get_all_windows(params: AuthInput) -> dict | list:
     """Get all window times in seconds: cancellation, registration, feedback, extras, skip.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON { cancellation_window, registration_window, feedback_window, extras_window, skip_window }
+        JSON { cancellation_window, registration_window, feedback_window, extras_window, skip_window }
     """
-    return _out(await _req("GET", "/config/windows", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/windows", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_registration_window",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_registration_window(params: AuthInput) -> str:
+async def mess_get_registration_window(params: AuthInput) -> dict | list:
     """Get the registration window time in seconds.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON integer (seconds)
+        JSON integer (seconds)
     """
-    return _out(await _req("GET", "/config/registration-window", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/registration-window", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_cancellation_window",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_cancellation_window(params: AuthInput) -> str:
+async def mess_get_cancellation_window(params: AuthInput) -> dict | list:
     """Get the cancellation window time in seconds.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON integer (seconds)
+        JSON integer (seconds)
     """
-    return _out(await _req("GET", "/config/cancellation-window", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/cancellation-window", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_feedback_window",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_feedback_window(params: AuthInput) -> str:
+async def mess_get_feedback_window(params: AuthInput) -> dict | list:
     """Get the feedback window time in seconds (time after a meal to submit feedback).
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON integer (seconds)
+        JSON integer (seconds)
     """
-    return _out(await _req("GET", "/config/feedback-window", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/feedback-window", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_extras_window",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_extras_window(params: AuthInput) -> str:
+async def mess_get_extras_window(params: AuthInput) -> dict | list:
     """Get the extra registration window time in seconds.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON integer (seconds)
+        JSON integer (seconds)
     """
-    return _out(await _req("GET", "/config/extras-window", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/extras-window", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_skip_window",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_skip_window(params: AuthInput) -> str:
+async def mess_get_skip_window(params: AuthInput) -> dict | list:
     """Get the skip window time in seconds.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON integer (seconds)
+        JSON integer (seconds)
     """
-    return _out(await _req("GET", "/config/skip-window", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/skip-window", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_registration_max_date",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_registration_max_date(params: AuthInput) -> str:
+async def mess_get_registration_max_date(params: AuthInput) -> dict | list:
     """Get the maximum future date allowed for meal registration.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON date string (YYYY-MM-DD)
+        JSON date string (YYYY-MM-DD)
     """
-    return _out(await _req("GET", "/config/registration-max-date", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/config/registration-max-date", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_get_max_cancellations",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_max_cancellations(params: MaxCancellationsInput) -> str:
+async def mess_get_max_cancellations(params: MaxCancellationsInput) -> dict | list:
     """Get the maximum free cancellations allowed per month for a meal.
 
     Args:
         params: auth_key/session, meal (required)
 
     Returns:
-        str: JSON integer
+        JSON integer
     """
-    return _out(await _req(
+    return await _req(
         "GET", "/config/max-cancellations",
         auth_key=params.auth_key, session=params.session,
         params={"meal": params.meal}
-    ))
+    )
 
 
 @mcp.tool(name="mess_get_meal_timings",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_meal_timings(params: MealTimingsInput) -> str:
+async def mess_get_meal_timings(params: MealTimingsInput) -> dict | list:
     """Get meal timings (start/end times) for each mess on a date.
 
     Args:
         params: optional on (YYYY-MM-DD), defaults to today
 
     Returns:
-        str: JSON { mess_id: [{ meal, start_time, end_time }] }
+        JSON { mess_id: [{ meal, start_time, end_time }] }
     """
-    return _out(await _req("GET", "/config/meal-timings", params={"on": params.on}))
+    return await _req("GET", "/config/meal-timings", params={"on": params.on})
 
 
 # ─────────────────────────────────────────────
@@ -1094,23 +1110,23 @@ async def mess_get_meal_timings(params: MealTimingsInput) -> str:
 
 @mcp.tool(name="mess_get_preferences",
           annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_get_preferences(params: AuthInput) -> str:
+async def mess_get_preferences(params: AuthInput) -> dict | list:
     """Get all user preferences.
 
     Args:
         params: auth_key or session
 
     Returns:
-        str: JSON UserPreferences:
+        JSON UserPreferences:
              notify_not_registered, notify_malloc_happened, auto_reset_token_daily,
-             enable_unregistered, nag_for_feedback
+             enable_unregistered, nag_for_feedback, skip_malloced
     """
-    return _out(await _req("GET", "/preferences", auth_key=params.auth_key, session=params.session))
+    return await _req("GET", "/preferences", auth_key=params.auth_key, session=params.session)
 
 
 @mcp.tool(name="mess_update_preferences",
           annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
-async def mess_update_preferences(params: UserPreferencesInput) -> str:
+async def mess_update_preferences(params: UserPreferencesInput) -> dict | list:
     """Update all user preferences (full replacement — all 5 fields required).
 
     Args:
@@ -1120,11 +1136,12 @@ async def mess_update_preferences(params: UserPreferencesInput) -> str:
           - auto_reset_token_daily: reset QR at 02:00 daily
           - enable_unregistered: allow on-spot availing at unregistered rates
           - nag_for_feedback: prompt after every availed meal
+          - skip_malloced: auto-skip randomly allocated meals
 
     Returns:
-        str: JSON status 204 on success
+        JSON status 204 on success
     """
-    return _out(await _req(
+    return await _req(
         "PUT", "/preferences",
         auth_key=params.auth_key, session=params.session,
         body={
@@ -1133,8 +1150,86 @@ async def mess_update_preferences(params: UserPreferencesInput) -> str:
             "auto_reset_token_daily": params.auto_reset_token_daily,
             "enable_unregistered": params.enable_unregistered,
             "nag_for_feedback": params.nag_for_feedback,
+            "skip_malloced": params.skip_malloced,
         }
-    ))
+    )
+
+
+# ─────────────────────────────────────────────
+# PROMPTS  (named workflows for common tasks)
+# ─────────────────────────────────────────────
+
+@mcp.prompt(name="nutrition")
+def prompt_nutrition(meal: str, date: str = "today") -> dict | list:
+    """Estimate nutrition breakdown for a mess meal using the menu"""
+    return (
+        f"Estimate the nutrition for {meal} on {date} at the user's registered mess. "
+        "Steps:\n"
+        "1. Call mess_get_registration to find which mess the user is registered at for this meal.\n"
+        "2. Call mess_get_menus to get the menu items for that mess and meal.\n"
+        "3. Using your own knowledge of Indian mess food, estimate per-item nutrition "
+        "(calories, protein, carbs, fat) for each dish served. Use typical home-style Indian "
+        "portion sizes (e.g. 1 medium roti ~120 kcal, 1 cup dal ~150 kcal). "
+        "Flag items where you are uncertain.\n"
+        "4. Sum up totals and present a table: dish | calories | protein | carbs | fat.\n"
+        "5. Add a total row. Note that this is an estimate — actual values vary by preparation."
+    )
+
+
+@mcp.prompt(name="check-my-meals")
+def prompt_check_meals(date: str = "today") -> dict | list:
+    """Show meal registrations for a given date (today, tomorrow, or YYYY-MM-DD)"""
+    return (
+        f"Check the user's mess registrations for {date}. "
+        "Use mess_get_registration for a single date or mess_get_registrations for a range. "
+        "Show meal type, mess name, and active/cancelled status. "
+        "Convert any paise values to rupees (÷ 100) before displaying."
+    )
+
+
+@mcp.prompt(name="register-meal")
+def prompt_register_meal(date: str, meal: str) -> dict | list:
+    """Register for a meal on a specific date"""
+    return (
+        f"Register the user for {meal} on {date}. "
+        "First call mess_get_info to list available messes. "
+        "Ask the user which mess they prefer if not specified. "
+        "Then call mess_create_registration. "
+        "If the window is closed (403), call mess_get_registration_window to explain when it opens."
+    )
+
+
+@mcp.prompt(name="cancel-meal")
+def prompt_cancel_meal(date: str, meal: str) -> dict | list:
+    """Cancel a meal registration"""
+    return (
+        f"Cancel the user's {meal} registration on {date}. "
+        "First call mess_get_cancellations_count to check remaining free cancellations. "
+        "Then call mess_cancel_registration. "
+        "If the window is closed (403), inform the user and suggest mess_skip_meal instead "
+        "(still charged but noted as skipped)."
+    )
+
+
+@mcp.prompt(name="my-bill")
+def prompt_bill() -> dict | list:
+    """Show the current month's mess bill in rupees"""
+    return (
+        "Show the user's current mess bill. "
+        "Call mess_get_bill for the current month. "
+        "Divide all paise values by 100 and display as rupees (₹). "
+        "Mention if the amount is projected (includes unserved future meals)."
+    )
+
+
+@mcp.prompt(name="whats-for-lunch")
+def prompt_menu(date: str = "today", meal: str = "lunch") -> dict | list:
+    """Show the mess menu for a meal on a date"""
+    return (
+        f"Show what's on the menu for {meal} on {date} across all messes. "
+        "Call mess_get_menus and filter to the relevant day and meal. "
+        "Present items grouped by mess, noting veg/non-veg categories."
+    )
 
 
 # ─────────────────────────────────────────────

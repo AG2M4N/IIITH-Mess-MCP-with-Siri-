@@ -17,6 +17,7 @@ Requires IIIT VPN or intranet access.
 ## Prerequisites
 
 - An auth key from [mess.iiit.ac.in](https://mess.iiit.ac.in) (Settings > Auth Keys), or a session cookie
+- uv
 
 ## Adding to Claude Code
 
@@ -41,7 +42,9 @@ claude mcp list
 
 ## Adding to GitHub Copilot (VS Code)
 
-### Via pip (recommended)
+Simplest way: Just ask Copilot to set it up by providing this repository URL.
+
+### Via uvx
 
 Create or edit `.vscode/mcp.json` in your workspace:
 
@@ -49,6 +52,7 @@ Create or edit `.vscode/mcp.json` in your workspace:
 {
   "servers": {
     "iiith-mess": {
+      "type": "stdio",
       "command": "uvx",
       "args": ["iiith-mess-mcp"],
       "env": {
@@ -65,6 +69,7 @@ Create or edit `.vscode/mcp.json` in your workspace:
 {
   "servers": {
     "iiith-mess": {
+      "type": "stdio",
       "command": "uv",
       "args": ["run", "--directory", "/path/to/IIITH-Mess-MCP", "python", "iiith_mess_mcp/server.py"],
       "env": {
@@ -74,8 +79,6 @@ Create or edit `.vscode/mcp.json` in your workspace:
   }
 }
 ```
-
-Alternatively, run `MCP: Add Server` from the VS Code command palette for a guided setup.
 
 ---
 

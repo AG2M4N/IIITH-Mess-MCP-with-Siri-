@@ -16,20 +16,22 @@ Requires IIIT VPN or intranet access.
 
 ## Prerequisites
 
-- Python 3
 - An auth key from [mess.iiit.ac.in](https://mess.iiit.ac.in) (Settings > Auth Keys), or a session cookie
-
-## Setup
-
-Clone the repo and create a `.env` file:
-
-```
-MESS_AUTH_KEY=your-auth-key-here
-```
 
 ## Adding to Claude Code
 
-Clone this repo and ask Claude to add it as an MCP.
+### Via uv (recommended)
+
+```bash
+claude mcp add iiith-mess -e MESS_AUTH_KEY=your-auth-key -- uvx iiith-mess-mcp
+```
+
+### Via local clone
+
+```bash
+git clone https://github.com/Kallind/IIITH-Mess-MCP
+claude mcp add iiith-mess -e MESS_AUTH_KEY=your-auth-key -- uv run --directory IIITH-Mess-MCP python iiith_mess_mcp/server.py
+```
 
 Verify it connected:
 
@@ -39,14 +41,32 @@ claude mcp list
 
 ## Adding to GitHub Copilot (VS Code)
 
+### Via pip (recommended)
+
 Create or edit `.vscode/mcp.json` in your workspace:
 
 ```json
 {
   "servers": {
     "iiith-mess": {
+      "command": "uvx",
+      "args": ["iiith-mess-mcp"],
+      "env": {
+        "MESS_AUTH_KEY": "your-auth-key-here"
+      }
+    }
+  }
+}
+```
+
+### Via local clone
+
+```json
+{
+  "servers": {
+    "iiith-mess": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/IIITH-Mess-MCP", "python", "server.py"],
+      "args": ["run", "--directory", "/path/to/IIITH-Mess-MCP", "python", "iiith_mess_mcp/server.py"],
       "env": {
         "MESS_AUTH_KEY": "your-auth-key-here"
       }

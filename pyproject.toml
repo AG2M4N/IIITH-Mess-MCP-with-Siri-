@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iiith-mess-mcp"
+version = "0.1.1"
+description = "MCP server for the IIIT Hyderabad Mess System"
+readme = "README.md"
+license = { text = "AGPL-3.0" }
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.26.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+iiith-mess-mcp = "iiith_mess_mcp:main"
+
+[project.urls]
+Repository = "https://github.com/Kallind/IIITH-Mess-MCP"
+
+[tool.hatch.build.targets.wheel]
+packages = ["iiith_mess_mcp"]

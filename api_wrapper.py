@@ -382,20 +382,26 @@ def interact():
                     "spoken": "Missing date or meal type. Please provide both."
                 }), 400
             
-            # Parse date - handle various formats
+            # Parse date - handle various formats including unicode spaces
             from datetime import datetime
             parsed_date = None
+            
+            # Normalize unicode spaces (e.g., \u202f non-breaking space)
+            date_normalized = date.replace('\u202f', ' ').replace('\xa0', ' ')
+            
             date_formats = [
                 "%Y-%m-%d",           # 2026-04-13
                 "%d %b %Y",           # 13 Apr 2026
                 "%d %b %Y at %I:%M %p",  # 13 Apr 2026 at 1:07 AM
+                "%d %B %Y",           # 13 April 2026 (full month name)
+                "%d %b %Y at %I:%M %p",  # with unicode space versions
                 "%d/%m/%Y",           # 13/04/2026
                 "%m/%d/%Y",           # 04/13/2026
             ]
             
             for fmt in date_formats:
                 try:
-                    parsed_date = datetime.strptime(date, fmt)
+                    parsed_date = datetime.strptime(date_normalized, fmt)
                     break
                 except ValueError:
                     continue
@@ -417,6 +423,77 @@ def interact():
                     "spoken": "Error: No authentication credentials. Set MESS_AUTH_KEY in .env"
                 }), 401
             
+            # Handle "all" meal type - cancel all meals for this date
+            if meal_type == "all":
+                try:
+                    # Get user's registrations for this date
+                    params = GetRegistrationsInput(from_date=date, to_date=date, **auth)
+                    registrations = run_async(mess_get_registrations(params))
+                    
+                    if not isinstance(registrations, list) or not registrations:
+                        return jsonify({
+                            "success": False,
+                            "spoken": f"No meals registered for {date}"
+                        }), 404
+                    
+                    # Cancel each meal
+                    cancelled_meals = []
+                    failed_meals = []
+                    
+                    for reg in registrations:
+                        reg_meal_type = reg.get("meal_type")
+                        
+                        try:
+                            params = MealDateTypeInput(
+                                meal_date=date,
+                                meal_type=reg_meal_type,
+                                **auth
+                            )
+                            result = run_async(mess_cancel_registration(params))
+                            
+                            if isinstance(result, dict) and result.get("ok"):
+                                cancelled_meals.append(reg_meal_type)
+                            else:
+                                failed_meals.append(reg_meal_type)
+                        except Exception as e:
+                            failed_meals.append(reg_meal_type)
+                    
+                    if cancelled_meals:
+                        meals_str = ", ".join(cancelled_meals)
+                        if failed_meals:
+                            failed_str = ", ".join(failed_meals)
+                            return jsonify({
+                                "success": True,
+                                "spoken": f"Cancelled {meals_str}. Failed to cancel: {failed_str}",
+                                "details": {"cancelled": cancelled_meals, "failed": failed_meals}
+                            }), 200
+                        else:
+                            from datetime import datetime
+                            try:
+                                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                                nice_date = date_obj.strftime("%B %d, %Y")
+                            except:
+                                nice_date = date
+                            
+                            return jsonify({
+                                "success": True,
+                                "spoken": f"Cancelled all meals on {nice_date}: {meals_str}",
+                                "details": {"cancelled": cancelled_meals}
+                            }), 200
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "spoken": f"Failed to cancel all meals for {date}",
+                            "details": {"failed": failed_meals}
+                        }), 400
+                
+                except Exception as e:
+                    return jsonify({
+                        "success": False,
+                        "spoken": f"Error cancelling meals: {str(e)}"
+                    }), 500
+            
+            # Single meal cancellation
             params = MealDateTypeInput(
                 meal_date=date,
                 meal_type=meal_type,
@@ -431,8 +508,7 @@ def interact():
                     error_msg = error_msg.get("message", str(error_msg))
                 return jsonify({
                     "success": False,
-                    "spoken": f"Failed to cancel: {error_msg}",
-                    "debug": {"error_type": type(result.get("error")).__name__, "full_response": result}
+                    "spoken": f"Failed to cancel: {error_msg}"
                 }), 400
             
             # Success - result is {"ok": true}
